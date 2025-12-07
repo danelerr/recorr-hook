@@ -1,66 +1,27 @@
-## Foundry
+# RecorrHook 🔄
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+> **FX Corridor Hook for Uniswap V4**  
+> Async intents + CoW matching + Dynamic fees for stablecoin corridors
 
-Foundry consists of:
+[![Built with Foundry](https://img.shields.io/badge/Built%20with-Foundry-FFDB1C.svg)](https://getfoundry.sh/)
+[![Solidity 0.8.26](https://img.shields.io/badge/Solidity-0.8.26-e6e6e6?logo=solidity)](https://soliditylang.org/)
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+## 🎯 Overview
 
-## Documentation
+RecorrHook is a specialized Uniswap V4 hook designed for cross-border stablecoin corridors. It implements:
 
-https://book.getfoundry.sh/
+- **Async Swap Intents**: Convert swaps into deferred intents for optimized settlement
+- **CoW Matching**: Peer-to-peer netting of opposing flows before hitting the AMM
+- **Dynamic Corridor Fees**: Protect LPs from directional flow risks with adaptive fees
+- **Swap & Bridge Integration**: Seamless cross-chain corridors via periphery router
+- **AVS-Ready**: Designed for future EigenLayer solver integration
 
-## Usage
+## 👤 Author
 
-### Build
+**Daniel** ([@danelerr](https://github.com/danelerr))
 
-```shell
-$ forge build
-```
+Built for Uniswap Hook Incubator V7 🦄
 
-### Test
+---
 
-```shell
-$ forge test
-```
-
-### Format
-
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+**Note**: This project is under active development for the Hookathon. Some features are incomplete or experimental.
