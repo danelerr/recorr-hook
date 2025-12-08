@@ -138,4 +138,5 @@ library RecorrHookTypes {
     error InvalidSwapMode();
     error ZeroAddress();
     error ZeroAmount();
+    error AmountTooLarge();
 }

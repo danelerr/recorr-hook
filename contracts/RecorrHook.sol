@@ -31,11 +31,11 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
  * - Phase 4: CoW matching and netting
  * - Phase 5: Dynamic fee implementation
  * 
- * IMPORTANT - Permission Migration:
- * Phase 1 (current): beforeSwapReturnDelta = false, afterSwapReturnDelta = false
- *   → No balance modifications, passthrough only
+ * IMPORTANT - Design Evolution:
+ * Phase 1 (current): BeforeSwapDelta returns ZERO_DELTA
+ *   → No balance modifications in beforeSwap, passthrough only
  * 
- * Phase 2+ (async intents): Will require beforeSwapReturnDelta = true
+ * Phase 2+ (async intents): May use non-zero BeforeSwapDelta to handle intent accounting
  *   → Need to REDEPLOY with new mined address that has these permission bits
  *   → The hook address encodes permissions in its bits (Uniswap v4 design)
  * 
@@ -44,7 +44,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
  * 
  * @custom:security Follow Uniswap v4 best practices:
  * - All hook callbacks protected with onlyPoolManager
- * - Hook address validated against permissions in constructor
+ * - Hook address validated via HookMiner to ensure correct permission bits
  * - Never call PoolManager from within hooks (use external settler contracts)
  */
 contract RecorrHook is BaseHook, Ownable {
@@ -76,6 +76,26 @@ contract RecorrHook is BaseHook, Ownable {
     constructor(
         IPoolManager _poolManager
     ) BaseHook(_poolManager) Ownable(msg.sender) {
+        // Validate that this contract was deployed to an address with correct permission bits
+        Hooks.validateHookPermissions(
+            this,
+            Hooks.Permissions({
+                beforeInitialize: false,
+                afterInitialize: false,
+                beforeAddLiquidity: false,
+                afterAddLiquidity: false,
+                beforeRemoveLiquidity: false,
+                afterRemoveLiquidity: false,
+                beforeSwap: true,
+                afterSwap: true,
+                beforeDonate: false,
+                afterDonate: false,
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: false,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
+            })
+        );
         nextIntentId = 1; // Start intent IDs at 1
     }
 
@@ -148,7 +168,8 @@ contract RecorrHook is BaseHook, Ownable {
             revert RecorrHookTypes.InvalidFeeParams();
         }
         
-        // Additional policy: limit to 10000 (1%) for our corridor use case
+        // Additional policy: limit each component to 1% (10000 in basis points)
+        // Total dynamic fee can reach up to 2% (baseFee + maxExtraFee)
         if (params.baseFee > 10000 || params.maxExtraFee > 10000) {
             revert RecorrHookTypes.InvalidFeeParams();
         }
@@ -169,18 +190,20 @@ contract RecorrHook is BaseHook, Ownable {
 
     /**
      * @notice Internal implementation of beforeSwap hook
-     * @dev Phase 1: Simple passthrough with logging
-     *      Phase 2+: Will implement intent creation logic
+     * @dev Phase 2: Creates async intents when hookData signals async mode
+     *      Phase 5: Applies dynamic fees based on netFlow imbalance
      * @param key The pool key
+     * @param params Swap parameters
+     * @param hookData Encoded mode: 0x01 = async intent, 0x00 = immediate swap
      * @return selector The function selector
-     * @return delta The balance delta (Phase 1: zero, Phase 2+: may be non-zero for intents)
-     * @return lpFeeOverride The LP fee override (0 = no override)
+     * @return delta The balance delta (zero for async, may be non-zero in future phases)
+     * @return lpFeeOverride The LP fee override (0 = no override, or dynamic fee)
      */
     function _beforeSwap(
         address, /* sender */
         PoolKey calldata key,
-        SwapParams calldata, /* params */
-        bytes calldata /* hookData */
+        SwapParams calldata params,
+        bytes calldata hookData
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
         PoolId poolId = key.toId();
         
@@ -193,42 +216,88 @@ contract RecorrHook is BaseHook, Ownable {
             );
         }
         
-        // Phase 1: Passthrough for corridor pools
-        // TODO Phase 2: Parse hookData to determine if this should be async
-        // TODO Phase 2: If async, create intent and return early
-        // TODO Phase 5: Calculate and apply dynamic fees using _calculateDynamicFee
+        // Phase 2: Check if this should be an async intent
+        if (hookData.length > 0 && hookData[0] == 0x01) {
+            // Decode intent parameters from hookData
+            // Format: [mode:uint8][minOut:uint256][deadline:uint48]
+            require(hookData.length >= 1 + 32 + 32, "Invalid hookData length");
+            
+            // Decode using abi.decode for safety and clarity
+            (uint256 minOut, uint48 deadline) = abi.decode(
+                hookData[1:], // Skip first byte (mode)
+                (uint256, uint48)
+            );
+            
+            // Create the intent
+            // NOTE: Using tx.origin temporarily for hackathon/PoC purposes.
+            // Production version should pass owner explicitly via hookData or
+            // use a dedicated router function to avoid tx.origin anti-pattern.
+            // See: https://consensys.github.io/smart-contract-best-practices/development-recommendations/solidity-specific/tx-origin/
+            _createIntent(tx.origin, poolId, params, minOut, deadline);
+            
+            // Return early - no immediate swap, intent stored for later settlement
+            return (
+                BaseHook.beforeSwap.selector,
+                BeforeSwapDeltaLibrary.ZERO_DELTA,
+                0
+            );
+        }
         
-        // For now, just pass through with no modifications
+        // Phase 5: Calculate dynamic fee based on netFlow
+        uint24 lpFeeOverride = _calculateDynamicFee(poolId, params);
+        
+        // Immediate swap with dynamic fee
         return (
             BaseHook.beforeSwap.selector,
             BeforeSwapDeltaLibrary.ZERO_DELTA,
-            0  // No LP fee override
+            lpFeeOverride
         );
     }
 
     /**
      * @notice Internal implementation of afterSwap hook
-     * @dev Used for tracking netFlow and updating metrics
+     * @dev Phase 5: Tracks netFlow to adjust dynamic fees
      * @param key The pool key
+     * @param params Swap parameters
+     * @param delta The balance delta from the swap
      * @return selector The function selector
-     * @return hookDeltaUnspecified The hook's delta (Phase 1: 0)
+     * @return hookDeltaUnspecified The hook's delta (0)
      */
     function _afterSwap(
         address, /* sender */
         PoolKey calldata key,
-        SwapParams calldata, /* params */
-        BalanceDelta, /* delta */
+        SwapParams calldata params,
+        BalanceDelta delta,
         bytes calldata /* hookData */
     ) internal override returns (bytes4, int128) {
         PoolId poolId = key.toId();
         
         // Only track netFlow for corridor pools
         if (isCorridorPool[poolId]) {
-            // Phase 1: No netFlow tracking yet
-            // TODO Phase 5: Update netFlow based on params.zeroForOne and delta
-            // int256 oldNet = netFlow[poolId];
-            // ... calculate netFlow change based on delta ...
-            // emit RecorrHookTypes.NetFlowUpdated(poolId, oldNet, netFlow[poolId]);
+            int256 oldNetFlow = netFlow[poolId];
+            
+            // Update netFlow based on swap direction and amounts
+            // In Uniswap v4: positive delta = user pays, negative delta = user receives
+            // Positive netFlow = more zeroForOne swaps, negative = more oneForZero
+            int128 amount0 = delta.amount0();
+            int128 amount1 = delta.amount1();
+            
+            if (params.zeroForOne) {
+                // zeroForOne: user sells token0, buys token1
+                // amount0 is positive (user pays), amount1 is negative (user receives)
+                // Track positive netFlow for zeroForOne pressure
+                netFlow[poolId] = oldNetFlow + _abs(amount0);
+            } else {
+                // oneForZero: user sells token1, buys token0
+                // amount1 is positive (user pays), amount0 is negative (user receives)
+                // Negative contribution to netFlow
+                netFlow[poolId] = oldNetFlow - _abs(amount1);
+            }
+            
+            // Emit event if netFlow changed significantly
+            if (netFlow[poolId] != oldNetFlow) {
+                emit RecorrHookTypes.NetFlowUpdated(poolId, oldNetFlow, netFlow[poolId]);
+            }
         }
         
         return (BaseHook.afterSwap.selector, 0);
@@ -245,6 +314,40 @@ contract RecorrHook is BaseHook, Ownable {
      */
     function getIntent(uint256 intentId) external view returns (RecorrHookTypes.Intent memory) {
         return intents[intentId];
+    }
+    
+    /**
+     * @notice Get all intent IDs for a specific user
+     * @dev WARNING: O(n) complexity - not scalable for production with many intents.
+     *      For mainnet, use off-chain indexing (subgraph, indexer) or maintain
+     *      per-user intent lists on-chain. This is a PoC/hackathon convenience function.
+     * @param user The user address
+     * @param maxResults Maximum number of results to return
+     * @return intentIds Array of intent IDs belonging to the user
+     */
+    function getUserIntents(address user, uint256 maxResults) external view returns (uint256[] memory intentIds) {
+        // Count user's intents first
+        uint256 count = 0;
+        uint256 totalIntents = nextIntentId - 1;
+        
+        for (uint256 i = 1; i <= totalIntents && count < maxResults; i++) {
+            if (intents[i].owner == user) {
+                count++;
+            }
+        }
+        
+        // Allocate array and populate
+        intentIds = new uint256[](count);
+        uint256 index = 0;
+        
+        for (uint256 i = 1; i <= totalIntents && index < count; i++) {
+            if (intents[i].owner == user) {
+                intentIds[index] = i;
+                index++;
+            }
+        }
+        
+        return intentIds;
     }
 
     /**
@@ -278,16 +381,123 @@ contract RecorrHook is BaseHook, Ownable {
     //                   SETTLEMENT FUNCTIONS
     // =============================================================
     
-    // TODO Phase 3: Implement settleCorridorBatch(uint256[] calldata intentIds)
-    // TODO Phase 4: Add CoW matching logic to settlement
+    /**
+     * @notice Settle a single intent (Phase 3)
+     * @dev Can be called by anyone (solvers) to execute pending intents
+     * @param intentId The ID of the intent to settle
+     * @param amountOut The actual output amount from the settlement
+     */
+    function settleIntent(uint256 intentId, uint256 amountOut) external {
+        RecorrHookTypes.Intent storage intent = intents[intentId];
+        
+        if (intent.settled) revert RecorrHookTypes.IntentAlreadySettled(intentId);
+        if (intent.deadline < block.timestamp) revert RecorrHookTypes.IntentExpired(intentId, intent.deadline);
+        if (amountOut < intent.minOut) revert RecorrHookTypes.MinOutputNotMet(intent.minOut, amountOut);
+        
+        // Mark as settled
+        intent.settled = true;
+        
+        emit RecorrHookTypes.IntentSettled(intentId, intent.owner, uint256(intent.amountSpecified), amountOut);
+        
+        // Note: Actual token transfers would happen in an external router/settler
+        // The hook only tracks the intent state
+    }
+    
+    /**
+     * @notice Batch settle multiple intents (Phase 3)
+     * @dev More gas efficient for multiple intents.
+     *      Uses "best-effort" approach: skips invalid intents (settled/expired/insufficient output)
+     *      instead of reverting, unlike settleIntent which reverts on any error.
+     * @param intentIds Array of intent IDs to settle
+     * @param amountsOut Array of output amounts (must match intentIds length)
+     */
+    function settleCorridorBatch(
+        uint256[] calldata intentIds,
+        uint256[] calldata amountsOut
+    ) external {
+        require(intentIds.length == amountsOut.length, "Length mismatch");
+        require(intentIds.length > 0, "Empty batch");
+        
+        for (uint256 i = 0; i < intentIds.length; i++) {
+            RecorrHookTypes.Intent storage intent = intents[intentIds[i]];
+            
+            // Skip already settled or expired intents
+            if (intent.settled || intent.deadline < block.timestamp) {
+                continue;
+            }
+            
+            // Check minimum output
+            if (amountsOut[i] < intent.minOut) {
+                continue;
+            }
+            
+            // Mark as settled
+            intent.settled = true;
+            
+            emit RecorrHookTypes.IntentSettled(intentIds[i], intent.owner, uint256(intent.amountSpecified), amountsOut[i]);
+        }
+    }
     
     // =============================================================
     //                    INTERNAL HELPERS
     // =============================================================
     
-    // TODO Phase 2: Implement _createIntent()
-    // TODO Phase 3: Implement _settleIntent()
-    // TODO Phase 4: Implement _calculateCoW()
+    /**
+     * @notice Helper to get absolute value of int128
+     * @param x The signed integer
+     * @return The absolute value as int256
+     */
+    function _abs(int128 x) private pure returns (int256) {
+        return x >= 0 ? int256(x) : -int256(x);
+    }
+    
+    /**
+     * @notice Create an async intent for later settlement
+     * @dev Phase 2 implementation - stores intent on-chain
+     * @param owner The user creating the intent
+     * @param poolId The pool ID
+     * @param params The swap parameters
+     * @param minOut Minimum output amount (slippage protection)
+     * @param deadline Intent expiration timestamp
+     */
+    function _createIntent(
+        address owner,
+        PoolId poolId,
+        SwapParams calldata params,
+        uint256 minOut,
+        uint48 deadline
+    ) internal {
+        if (deadline <= block.timestamp) revert RecorrHookTypes.InvalidDeadline(deadline);
+        if (minOut == 0) revert RecorrHookTypes.ZeroAmount();
+        
+        // Convert amountSpecified to absolute value (intent notional amount)
+        uint256 absAmount = uint256(params.amountSpecified < 0 ? -params.amountSpecified : params.amountSpecified);
+        if (absAmount == 0) revert RecorrHookTypes.ZeroAmount();
+        if (absAmount > type(uint128).max) revert RecorrHookTypes.AmountTooLarge();
+        
+        uint256 intentId = nextIntentId++;
+        
+        intents[intentId] = RecorrHookTypes.Intent({
+            owner: owner,
+            zeroForOne: params.zeroForOne,
+            amountSpecified: uint128(absAmount),
+            sqrtPriceLimitX96: params.sqrtPriceLimitX96,
+            minOut: minOut,
+            deadline: deadline,
+            settled: false,
+            poolId: poolId
+        });
+        
+        emit RecorrHookTypes.IntentCreated(
+            intentId,
+            owner,
+            poolId,
+            params.zeroForOne,
+            uint128(absAmount),
+            minOut,
+            deadline
+        );
+    }
     
     /**
      * @notice Calculate dynamic fee based on net flow imbalance
