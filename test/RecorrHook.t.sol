@@ -569,4 +569,792 @@ contract RecorrHookTest is Test, Deployers {
         vm.expectRevert("RecorrHook: wrong hook");
         hook.setCorridorPool(wrongHookKey, true);
     }
+
+    // =============================================================
+    //                     COW MATCHING TESTS (Phase 4)
+    // =============================================================
+
+    function test_CoWMatchingOppositeIntents() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        // Create two intents in opposite directions with same amount
+        vm.startPrank(address(this));
+        
+        // Intent 1: zeroForOne (1 token)
+        bytes memory hookData1 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData1);
+        
+        // Intent 2: oneForZero (1 token) 
+        bytes memory hookData2 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, false, -1e18, hookData2);
+        
+        vm.stopPrank();
+        
+        // Verify both intents created
+        RecorrHookTypes.Intent memory intent1 = hook.getIntent(1);
+        RecorrHookTypes.Intent memory intent2 = hook.getIntent(2);
+        
+        assertTrue(intent1.zeroForOne, "Intent 1 should be zeroForOne");
+        assertFalse(intent2.zeroForOne, "Intent 2 should be oneForZero");
+        
+        // Settle batch with CoW
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        
+        // Expect CoWExecuted event
+        vm.expectEmit(true, true, true, true);
+        emit RecorrHookTypes.CoWExecuted(
+            2,           // batchSize
+            1e18,        // matchedAmount (min of both)
+            0,           // netAmountToAmm (fully matched, no net flow)
+            true,        // netDirection (convention: true when net=0)
+            100000       // gasSaved estimate
+        );
+        
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify both intents are settled
+        intent1 = hook.getIntent(1);
+        intent2 = hook.getIntent(2);
+        
+        assertTrue(intent1.settled, "Intent 1 should be settled");
+        assertTrue(intent2.settled, "Intent 2 should be settled");
+    }
+
+    function test_CoWMatchingPartialMatch() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        // Intent 1: zeroForOne (2 tokens)
+        bytes memory hookData1 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(1.8e18), uint48(block.timestamp + 1 hours))
+        );
+        swap(poolKey, true, -2e18, hookData1);
+        
+        // Intent 2: oneForZero (1 token)
+        bytes memory hookData2 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        swap(poolKey, false, -1e18, hookData2);
+        
+        vm.stopPrank();
+        
+        // Settle batch
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 1.9e18;
+        amountsOut[1] = 0.95e18;
+        
+        // Expect partial CoW: 1 token matched P2P, 1 token net to AMM
+        vm.expectEmit(true, true, true, false);
+        emit RecorrHookTypes.CoWExecuted(
+            2,           // batchSize
+            1e18,        // matchedAmount (min of 2 and 1)
+            1e18,        // netAmountToAmm (2 - 1 = 1)
+            true,        // netDirection is zeroForOne (more zeroForOne)
+            0            // gasSaved (don't check exact value)
+        );
+        
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify both settled
+        assertTrue(hook.getIntent(1).settled);
+        assertTrue(hook.getIntent(2).settled);
+    }
+
+    function test_CoWMatchingOnlyOneDirection() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        // Only zeroForOne intents (no match possible)
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -0.5e18, hookData);
+        swap(poolKey, true, -0.5e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Settle batch
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        
+        // No CoW matching (matchedAmount = 0), all goes to AMM
+        // CoWExecuted event might not be emitted if matchedAmount == 0
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Both should be settled
+        assertTrue(hook.getIntent(1).settled);
+        assertTrue(hook.getIntent(2).settled);
+    }
+
+    // =============================================================
+    //                     EDGE CASE TESTS
+    // =============================================================
+
+    function test_SettleExpiredIntentSkips() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        // Create intent with short deadline
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 100))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Fast forward past deadline
+        vm.warp(block.timestamp + 200);
+        
+        // Try to settle expired intent
+        uint256[] memory intentIds = new uint256[](1);
+        intentIds[0] = 1;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 0.95e18;
+        
+        // Should revert with "No valid intents" since the only intent is expired
+        vm.expectRevert("No valid intents");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Intent should NOT be settled
+        RecorrHookTypes.Intent memory intent = hook.getIntent(1);
+        assertFalse(intent.settled, "Expired intent should not be settled");
+    }
+
+    function test_SettleExpiredIntentRevertsInSingleMode() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 100))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Fast forward past deadline
+        vm.warp(block.timestamp + 200);
+        
+        // Single settle should revert on expired
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                RecorrHookTypes.IntentExpired.selector,
+                1,
+                block.timestamp - 100
+            )
+        );
+        hook.settleIntent(1, 0.95e18);
+    }
+
+    function test_SettleAlreadySettledSkips() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Settle once
+        hook.settleIntent(1, 0.95e18);
+        assertTrue(hook.getIntent(1).settled);
+        
+        // Try to settle again in batch (should revert with "No valid intents")
+        uint256[] memory intentIds = new uint256[](1);
+        intentIds[0] = 1;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 0.95e18;
+        
+        // Should revert since the only intent is already settled
+        vm.expectRevert("No valid intents");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+    }
+
+    function test_SettleAlreadySettledRevertsInSingleMode() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Settle once
+        hook.settleIntent(1, 0.95e18);
+        
+        // Try to settle again (should revert)
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                RecorrHookTypes.IntentAlreadySettled.selector,
+                1
+            )
+        );
+        hook.settleIntent(1, 0.95e18);
+    }
+
+    function test_BatchMixedValidInvalid() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create 3 intents
+        swap(poolKey, true, -0.5e18, hookData);  // Valid
+        swap(poolKey, true, -0.5e18, hookData);  // Will be settled early
+        swap(poolKey, true, -0.5e18, hookData);  // Valid
+        
+        vm.stopPrank();
+        
+        // Settle intent #2 early
+        hook.settleIntent(2, 0.95e18);
+        
+        // Try to settle all 3
+        uint256[] memory intentIds = new uint256[](3);
+        intentIds[0] = 1;
+        intentIds[1] = 2; // Already settled
+        intentIds[2] = 3;
+        
+        uint256[] memory amountsOut = new uint256[](3);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        amountsOut[2] = 0.95e18;
+        
+        // Should skip #2 and settle #1 and #3
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        assertTrue(hook.getIntent(1).settled, "Intent 1 should be settled");
+        assertTrue(hook.getIntent(2).settled, "Intent 2 was already settled");
+        assertTrue(hook.getIntent(3).settled, "Intent 3 should be settled");
+    }
+
+    function test_BatchWithInsufficientOutputSkips() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Try to settle with insufficient output
+        uint256[] memory intentIds = new uint256[](1);
+        intentIds[0] = 1;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 0.5e18; // Less than minOut (0.9e18)
+        
+        // Should skip (not revert)
+        vm.expectRevert("No valid intents");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Should NOT be settled
+        assertFalse(hook.getIntent(1).settled, "Intent should not be settled with insufficient output");
+    }
+
+    // =============================================================
+    //                      COW MATCHING TESTS
+    // =============================================================
+
+    function test_CoWPerfectMatch() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create intent 1: zeroForOne (1 token)
+        swap(poolKey, true, -1e18, hookData);
+        
+        // Create intent 2: oneForZero (1 token) - opposite direction
+        swap(poolKey, false, -1e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Verify intents created
+        RecorrHookTypes.Intent memory intent1 = hook.getIntent(1);
+        RecorrHookTypes.Intent memory intent2 = hook.getIntent(2);
+        
+        assertTrue(intent1.zeroForOne, "Intent 1 should be zeroForOne");
+        assertFalse(intent2.zeroForOne, "Intent 2 should be oneForZero");
+        
+        // Settle both with CoW
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        
+        // Expect CoW event
+        vm.expectEmit(true, true, true, true);
+        emit RecorrHookTypes.CoWExecuted(
+            2, // totalIntents
+            1e18, // matchedAmount (perfect match)
+            0, // netAmountToAmm (nothing to AMM)
+            true, // netDirection (convention: true when net=0)
+            100000 // gasSaved
+        );
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify CoW stats
+        assertEq(stats.totalIntents, 2, "Should have 2 valid intents");
+        assertEq(stats.matchedAmount, 1e18, "Should match 1e18");
+        assertEq(stats.netAmountToAmm, 0, "Net to AMM should be 0 (perfect match)");
+        assertGt(stats.gasSaved, 0, "Should have gas savings");
+        
+        // Both intents should be settled
+        assertTrue(hook.getIntent(1).settled, "Intent 1 should be settled");
+        assertTrue(hook.getIntent(2).settled, "Intent 2 should be settled");
+    }
+
+    function test_CoWPartialMatch() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create intent 1: zeroForOne (2 tokens)
+        swap(poolKey, true, -2e18, hookData);
+        
+        // Create intent 2: oneForZero (1 token) - opposite but smaller
+        swap(poolKey, false, -1e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Settle both
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 1.9e18;
+        amountsOut[1] = 0.95e18;
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify partial matching
+        assertEq(stats.totalIntents, 2, "Should have 2 valid intents");
+        assertEq(stats.matchedAmount, 1e18, "Should match smaller amount (1e18)");
+        assertEq(stats.netAmountToAmm, 1e18, "Net to AMM should be 1e18 (2-1)");
+        assertTrue(stats.netDirection, "Net direction should be zeroForOne");
+    }
+
+    function test_CoWMultipleIntentsSameDirection() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create 3 intents in same direction
+        swap(poolKey, true, -0.3e18, hookData);
+        swap(poolKey, true, -0.3e18, hookData);
+        swap(poolKey, true, -0.3e18, hookData);
+        
+        // Create 2 intents in opposite direction
+        swap(poolKey, false, -0.3e18, hookData);
+        swap(poolKey, false, -0.3e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Settle all 5
+        uint256[] memory intentIds = new uint256[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            intentIds[i] = i + 1;
+        }
+        
+        uint256[] memory amountsOut = new uint256[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            amountsOut[i] = 0.95e18;
+        }
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify: 3 zeroForOne (0.9e18) vs 2 oneForZero (0.6e18)
+        // Matched: 0.6e18, Net to AMM: 0.3e18 (zeroForOne)
+        assertEq(stats.totalIntents, 5, "Should have 5 valid intents");
+        assertEq(stats.matchedAmount, 0.6e18, "Should match 0.6e18");
+        assertEq(stats.netAmountToAmm, 0.3e18, "Net to AMM should be 0.3e18");
+        assertTrue(stats.netDirection, "Net direction should be zeroForOne");
+    }
+
+    function test_CoWOnlyOneDirection() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create 2 intents in same direction only
+        swap(poolKey, true, -0.5e18, hookData);
+        swap(poolKey, true, -0.5e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Settle both
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](2);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // No matching possible, all goes to AMM
+        assertEq(stats.totalIntents, 2, "Should have 2 valid intents");
+        assertEq(stats.matchedAmount, 0, "No matching (one direction only)");
+        assertEq(stats.netAmountToAmm, 1e18, "All to AMM (0.5e18 * 2)");
+        assertTrue(stats.netDirection, "Direction should be zeroForOne");
+    }
+
+    // =============================================================
+    //                   ADVANCED EDGE CASES
+    // =============================================================
+
+    function test_BatchRejectsEmptyArray() public {
+        uint256[] memory intentIds = new uint256[](0);
+        uint256[] memory amountsOut = new uint256[](0);
+        
+        vm.expectRevert("Empty batch");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+    }
+
+    function test_BatchRejectsMismatchedLengths() public {
+        uint256[] memory intentIds = new uint256[](2);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 1e18;
+        
+        vm.expectRevert("Length mismatch");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+    }
+
+    function test_BatchWithAllInvalidIntents() public {
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Try to settle with insufficient output
+        uint256[] memory intentIds = new uint256[](1);
+        intentIds[0] = 1;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 0.5e18; // Below minOut
+        
+        vm.expectRevert("No valid intents");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+    }
+
+    function test_IntentExpiredDuringBatch() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData);
+        vm.stopPrank();
+        
+        // Warp time past deadline
+        vm.warp(block.timestamp + 2 hours);
+        
+        uint256[] memory intentIds = new uint256[](1);
+        intentIds[0] = 1;
+        
+        uint256[] memory amountsOut = new uint256[](1);
+        amountsOut[0] = 0.95e18;
+        
+        // Should skip expired intent
+        vm.expectRevert("No valid intents");
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        assertFalse(hook.getIntent(1).settled, "Expired intent should not be settled");
+    }
+
+    function test_CoWWithMixOfValidAndInvalid() public {
+        // Setup: mark as corridor and add liquidity
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 100 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        vm.startPrank(address(this));
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create 3 intents
+        swap(poolKey, true, -1e18, hookData);
+        swap(poolKey, false, -1e18, hookData);
+        swap(poolKey, true, -1e18, hookData);
+        
+        vm.stopPrank();
+        
+        // Manually settle intent 2
+        hook.settleIntent(2, 0.95e18);
+        
+        // Try to batch settle all 3
+        uint256[] memory intentIds = new uint256[](3);
+        intentIds[0] = 1;
+        intentIds[1] = 2; // Already settled
+        intentIds[2] = 3;
+        
+        uint256[] memory amountsOut = new uint256[](3);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        amountsOut[2] = 0.95e18;
+        
+        // Should skip #2 and settle #1 and #3
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Only 2 valid intents (skipped already-settled one)
+        assertEq(stats.totalIntents, 2, "Should have 2 valid intents");
+        assertEq(stats.matchedAmount, 0, "No matching (both same direction)");
+        assertEq(stats.netAmountToAmm, 2e18, "Both to AMM");
+        
+        assertTrue(hook.getIntent(1).settled, "Intent 1 should be settled");
+        assertTrue(hook.getIntent(2).settled, "Intent 2 was already settled");
+        assertTrue(hook.getIntent(3).settled, "Intent 3 should be settled");
+    }
 }

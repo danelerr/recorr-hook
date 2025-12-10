@@ -55,11 +55,13 @@ library RecorrHookTypes {
 
     /// @notice Statistics about a CoW settlement batch
     struct CoWStats {
+        uint256 totalIntents;      // Number of valid intents in batch
         uint256 totalZeroForOne;   // Total amount of zeroForOne intents
         uint256 totalOneForZero;   // Total amount of oneForZero intents
         uint256 matchedAmount;     // Amount settled peer-to-peer
-        uint256 netAmountToAmm;    // Net amount sent to AMM (fixed naming)
+        uint256 netAmountToAmm;    // Net amount sent to AMM
         bool netDirection;         // Direction of net flow (true = zeroForOne)
+        uint256 gasSaved;          // Estimated gas saved from CoW matching
     }
 
     // =============================================================
