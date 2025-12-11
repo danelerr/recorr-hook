@@ -1362,6 +1362,45 @@ contract RecorrHookTest is Test, Deployers {
     //                   END-TO-END & GAS TESTS
     // =============================================================
 
+    function test_ResetNetFlow() public {
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create intent and settle to generate net flow
+        swap(poolKey, true, -1e18, hookData);
+        hook.settleIntent(1, 0.95e18);
+        
+        // Verify net flow is non-zero
+        int256 netFlowBefore = hook.getNetFlow(poolKey);
+        assertGt(netFlowBefore, 0, "Net flow should be positive");
+        
+        // Reset net flow (only owner)
+        hook.resetNetFlow(poolKey);
+        
+        // Verify reset
+        int256 netFlowAfter = hook.getNetFlow(poolKey);
+        assertEq(netFlowAfter, 0, "Net flow should be reset to 0");
+        
+        // Verify non-owner cannot reset
+        vm.prank(address(0x123));
+        vm.expectRevert();
+        hook.resetNetFlow(poolKey);
+    }
+
     function test_E2E_CoWFlowWithDynamicFees() public {
         // Setup: corridor pool with dynamic fees
         hook.setCorridorPool(poolKey, true);
