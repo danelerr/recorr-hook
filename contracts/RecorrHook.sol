@@ -230,19 +230,22 @@ contract RecorrHook is BaseHook, Ownable {
                 (uint256, uint48)
             );
             
-            // Create the intent
-            // NOTE: Using tx.origin temporarily for hackathon/PoC purposes.
-            // Production version should:
-            //   - Pass owner explicitly via hookData, OR
-            //   - Use a dedicated router function to create intents without executing swaps
+            // WARNING: Using tx.origin for hackathon / PoC purposes only.
+            // In production we would pass the owner address explicitly from the router
+            // to avoid any tx.origin-based attacks or limitations.
             // See: https://consensys.github.io/smart-contract-best-practices/development-recommendations/solidity-specific/tx-origin/
             _createIntent(tx.origin, poolId, params, minOut, deadline);
             
-            // IMPORTANT: Returning ZERO_DELTA does NOT cancel the swap in v4.
-            // The PoolManager will still execute the swap normally after this hook.
-            // For a production "async-only" mode, use a dedicated router that creates
-            // intents without calling PoolManager.swap(), or revert here to block the swap.
-            // Current behavior: Intent is created AND swap executes (suitable for demo/testing).
+            // NOTE: Hackathon / demo behavior:
+            // - We CREATE an async intent for analytics / CoW batch settlement
+            // - AND we still let the underlying swap execute normally (ZERO_DELTA doesn't cancel in v4)
+            //
+            // In a production deployment you would:
+            // - either only create intents from a dedicated router
+            // - or revert here to prevent the swap from executing immediately
+            //
+            // Current behavior demonstrates the CoW coordination concept while maintaining
+            // compatibility with generic routers.
             return (
                 BaseHook.beforeSwap.selector,
                 BeforeSwapDeltaLibrary.ZERO_DELTA,
@@ -384,6 +387,20 @@ contract RecorrHook is BaseHook, Ownable {
         return netFlow[key.toId()];
     }
 
+    /**
+     * @notice Reset net flow for a corridor pool
+     * @dev In production, an operator or AVS could reset netFlow periodically
+     *      or use a time-windowed scheme. For the hackathon we use a simple
+     *      accumulator to illustrate the dynamic fee logic.
+     * @param key The pool key
+     */
+    function resetNetFlow(PoolKey calldata key) external onlyOwner {
+        PoolId poolId = key.toId();
+        int256 oldFlow = netFlow[poolId];
+        netFlow[poolId] = 0;
+        emit RecorrHookTypes.NetFlowUpdated(poolId, oldFlow, 0);
+    }
+
     // =============================================================
     //                   SETTLEMENT FUNCTIONS
     // =============================================================
@@ -438,6 +455,11 @@ contract RecorrHook is BaseHook, Ownable {
         // First pass: validate and aggregate
         for (uint256 i = 0; i < intentIds.length; i++) {
             RecorrHookTypes.Intent storage intent = intents[intentIds[i]];
+            
+            // Skip non-existent intents
+            if (intent.owner == address(0)) {
+                continue;
+            }
             
             // Skip intents that won't be processed (best-effort)
             if (intent.settled || intent.deadline < block.timestamp) {
