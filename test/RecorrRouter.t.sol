@@ -57,7 +57,7 @@ contract RecorrRouterTest is Test, Deployers {
         );
 
         // Deploy hook
-        hook = new RecorrHook{salt: salt}(IPoolManager(address(manager)));
+        hook = new RecorrHook{salt: salt}(IPoolManager(address(manager)), address(this));
         assertEq(address(hook), expectedHookAddress, "hook address mismatch");
 
         // Deploy router

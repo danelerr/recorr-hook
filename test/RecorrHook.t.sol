@@ -49,7 +49,7 @@ contract RecorrHookTest is Test, Deployers {
         );
 
         // Deploy hook with the mined salt
-        hook = new RecorrHook{salt: salt}(IPoolManager(address(manager)));
+        hook = new RecorrHook{salt: salt}(IPoolManager(address(manager)), address(this));
         
         // Verify address matches (critical for permission validation)
         assertEq(address(hook), expectedHookAddress, "hook address mismatch");

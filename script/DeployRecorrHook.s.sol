@@ -10,12 +10,13 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {CurrencyLibrary} from "v4-core/src/types/Currency.sol";
-import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 import {RecorrHook} from "../contracts/RecorrHook.sol";
+import {RecorrHookTypes} from "../contracts/RecorrHookTypes.sol";
 import {RecorrRouter} from "../contracts/RecorrRouter.sol";
 import {IMockBridge} from "../contracts/interfaces/IMockBridge.sol";
-import {MockBridge} from "../contracts/mocks/MockBridge.sol";
+import {MockBridge} from "../contracts/MockBridge.sol";
 import {MockUSDC} from "../contracts/mocks/MockUSDC.sol";
 import {MockBOB} from "../contracts/mocks/MockBOB.sol";
 import {HookMiner} from "../test/utils/HookMiner.sol";
@@ -57,10 +58,12 @@ contract DeployRecorrHook is Script {
     uint160 constant HOOK_FLAGS =
         uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG);
 
-    // PoolManager addresses (official Uniswap v4 deployments)
-    // NOTE: These are placeholder addresses - update with actual v4 deployments
-    address constant POOL_MANAGER_SEPOLIA = 0x7Da1D65F8B249183667cdE74C5CBD46dD38AA829; // v4 PoolManager
-    address constant POOL_MANAGER_BASE_SEPOLIA = 0x7Da1D65F8B249183667cdE74C5CBD46dD38AA829; // v4 PoolManager
+    // Foundry CREATE2 deployer (factory address used by `new {salt}`)
+    address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    // PoolManager address (official Uniswap v4 deployment on Sepolia)
+    // Source: https://docs.uniswap.org/contracts/v4/deployments
+    address constant POOL_MANAGER_SEPOLIA = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543; // v4 PoolManager (Sepolia)
     
     // Pool configuration
     int24 constant TICK_SPACING = 60; // 0.3% tick spacing
@@ -101,7 +104,15 @@ contract DeployRecorrHook is Script {
         console2.log("MockUSDC deployed at:", address(usdc));
         console2.log("MockBOB deployed at:", address(bob));
         console2.log("Deployer USDC balance:", usdc.balanceOf(deployer) / 10 ** 6, "USDC");
-        console2.log("Deployer BOB balance:", bob.balanceOf(deployer) / 10 ** 6, "BOB\n");
+        console2.log("Deployer BOB balance:", bob.balanceOf(deployer) / 10 ** 6, "BOB");
+        
+        // Extra mint to support liquidity (1e18 liquidityDelta requires massive token amounts)
+        uint256 extraMint = 1_000_000_000_000_000_000_000_000; // 1e24 units (1e18 tokens with 6 decimals)
+        usdc.ownerMint(deployer, extraMint);
+        bob.ownerMint(deployer, extraMint);
+        console2.log("Extra tokens minted for liquidity provision");
+        console2.log("Deployer USDC balance (after extra mint):", usdc.balanceOf(deployer) / 10 ** 6, "USDC");
+        console2.log("Deployer BOB balance (after extra mint):", bob.balanceOf(deployer) / 10 ** 6, "BOB\n");
 
         // Step 2: Deploy MockBridge
         console2.log("--- Step 2: Deploying MockBridge ---");
@@ -111,20 +122,22 @@ contract DeployRecorrHook is Script {
         // Step 3: Mine and deploy RecorrHook
         console2.log("--- Step 3: Mining Hook Address ---");
         console2.log("Mining address with flags:", HOOK_FLAGS);
+        console2.log("Using CREATE2 deployer:", CREATE2_DEPLOYER);
         console2.log("This may take 1-2 minutes...");
 
         (address hookAddress, bytes32 salt) = HookMiner.find(
-            deployer,
+            CREATE2_DEPLOYER, // ✅ Use the actual CREATE2 deployer, not EOA
             HOOK_FLAGS,
             type(RecorrHook).creationCode,
-            abi.encode(IPoolManager(poolManager))
+            abi.encode(IPoolManager(poolManager), deployer) // Pass deployer as initial owner
         );
 
         console2.log("Mined Hook Address:", hookAddress);
         console2.log("Salt:", vm.toString(salt));
         
         RecorrHook hook = new RecorrHook{salt: salt}(
-            IPoolManager(poolManager)
+            IPoolManager(poolManager),
+            deployer // Set deployer as initial owner
         );
 
         require(address(hook) == hookAddress, "Hook address mismatch");
@@ -181,10 +194,10 @@ contract DeployRecorrHook is Script {
         
         hook.setPoolFeeParams(
             poolKey,
-            RecorrHook.FeeParams({
+            RecorrHookTypes.FeeParams({
                 baseFee: BASE_FEE,
                 maxExtraFee: MAX_EXTRA_FEE,
-                threshold: THRESHOLD
+                netFlowThreshold: int256(THRESHOLD)
             })
         );
         console2.log("Fee params configured:");
@@ -209,7 +222,7 @@ contract DeployRecorrHook is Script {
         // Using full range for simplicity: tick -887220 to 887220
         lpRouter.modifyLiquidity(
             poolKey,
-            IPoolManager.ModifyLiquidityParams({
+            ModifyLiquidityParams({
                 tickLower: -887220,
                 tickUpper: 887220,
                 liquidityDelta: 1000000000000000000, // 1e18 liquidity units

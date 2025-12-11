@@ -74,8 +74,9 @@ contract RecorrHook is BaseHook, Ownable {
     // =============================================================
 
     constructor(
-        IPoolManager _poolManager
-    ) BaseHook(_poolManager) Ownable(msg.sender) {
+        IPoolManager _poolManager,
+        address _initialOwner
+    ) BaseHook(_poolManager) Ownable(_initialOwner) {
         // Validate that this contract was deployed to an address with correct permission bits
         Hooks.validateHookPermissions(
             this,
