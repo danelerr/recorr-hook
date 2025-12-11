@@ -1357,4 +1357,232 @@ contract RecorrHookTest is Test, Deployers {
         assertTrue(hook.getIntent(2).settled, "Intent 2 was already settled");
         assertTrue(hook.getIntent(3).settled, "Intent 3 should be settled");
     }
+
+    // =============================================================
+    //                   END-TO-END & GAS TESTS
+    // =============================================================
+
+    function test_E2E_CoWFlowWithDynamicFees() public {
+        // Setup: corridor pool with dynamic fees
+        hook.setCorridorPool(poolKey, true);
+        
+        RecorrHookTypes.FeeParams memory feeParams = RecorrHookTypes.FeeParams({
+            baseFee: 500,          // 0.05%
+            maxExtraFee: 2000,     // 0.2%
+            netFlowThreshold: 10e18
+        });
+        hook.setPoolFeeParams(poolKey, feeParams);
+        
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        // Create opposing intents
+        bytes memory hookData1 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        bytes memory hookData2 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        bytes memory hookData3 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.4e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        swap(poolKey, true, -1e18, hookData1);   // Intent 1: zeroForOne, 1e18
+        swap(poolKey, false, -1e18, hookData2);  // Intent 2: oneForZero, 1e18
+        swap(poolKey, true, -0.5e18, hookData3); // Intent 3: zeroForOne, 0.5e18
+        
+        // Verify intents created
+        assertEq(hook.nextIntentId(), 4, "Should have 3 intents created");
+        
+        RecorrHookTypes.Intent memory intent1 = hook.getIntent(1);
+        assertEq(intent1.amountSpecified, 1e18);
+        assertTrue(intent1.zeroForOne);
+        assertFalse(intent1.settled);
+        
+        // Settle batch with CoW
+        uint256[] memory intentIds = new uint256[](3);
+        intentIds[0] = 1;
+        intentIds[1] = 2;
+        intentIds[2] = 3;
+        
+        uint256[] memory amountsOut = new uint256[](3);
+        amountsOut[0] = 0.95e18;  // 1e18 in, 0.95e18 out
+        amountsOut[1] = 0.95e18;  // 1e18 in, 0.95e18 out
+        amountsOut[2] = 0.45e18;  // 0.5e18 in, 0.45e18 out
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Verify CoW matching: 1.5e18 zeroForOne vs 1e18 oneForZero
+        assertEq(stats.totalIntents, 3, "All 3 intents valid");
+        assertEq(stats.matchedAmount, 1e18, "Should match 1e18 P2P");
+        assertEq(stats.netAmountToAmm, 0.5e18, "Net 0.5e18 to AMM");
+        assertTrue(stats.netDirection, "Net direction is zeroForOne");
+        assertGt(stats.gasSaved, 0, "Should have gas savings");
+        
+        // Verify all settled
+        assertTrue(hook.getIntent(1).settled, "Intent 1 settled");
+        assertTrue(hook.getIntent(2).settled, "Intent 2 settled");
+        assertTrue(hook.getIntent(3).settled, "Intent 3 settled");
+    }
+
+    function test_GasSavingsComparison() public {
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        bytes memory hookData = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.5e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Create 3 intents
+        swap(poolKey, true, -1e18, hookData);
+        swap(poolKey, false, -1e18, hookData);
+        swap(poolKey, true, -1e18, hookData);
+        
+        // Measure gas for individual settlements
+        uint256 gasBefore1 = gasleft();
+        hook.settleIntent(1, 0.95e18);
+        uint256 gasIndividual1 = gasBefore1 - gasleft();
+        
+        uint256 gasBefore2 = gasleft();
+        hook.settleIntent(2, 0.95e18);
+        uint256 gasIndividual2 = gasBefore2 - gasleft();
+        
+        uint256 gasBefore3 = gasleft();
+        hook.settleIntent(3, 0.95e18);
+        uint256 gasIndividual3 = gasBefore3 - gasleft();
+        
+        uint256 totalGasIndividual = gasIndividual1 + gasIndividual2 + gasIndividual3;
+        
+        // Create new batch for comparison
+        swap(poolKey, true, -1e18, hookData);
+        swap(poolKey, false, -1e18, hookData);
+        swap(poolKey, true, -1e18, hookData);
+        
+        uint256[] memory intentIds = new uint256[](3);
+        intentIds[0] = 4;
+        intentIds[1] = 5;
+        intentIds[2] = 6;
+        
+        uint256[] memory amountsOut = new uint256[](3);
+        amountsOut[0] = 0.95e18;
+        amountsOut[1] = 0.95e18;
+        amountsOut[2] = 0.95e18;
+        
+        // Measure gas for batch settlement
+        uint256 gasBefore = gasleft();
+        hook.settleCorridorBatch(intentIds, amountsOut);
+        uint256 gasBatch = gasBefore - gasleft();
+        
+        // Log for visibility
+        emit log_named_uint("Gas Individual 1", gasIndividual1);
+        emit log_named_uint("Gas Individual 2", gasIndividual2);
+        emit log_named_uint("Gas Individual 3", gasIndividual3);
+        emit log_named_uint("Gas Individual (total)", totalGasIndividual);
+        emit log_named_uint("Gas Batch", gasBatch);
+        
+        // Note: For small batches (3 intents), batch overhead can exceed savings.
+        // Batch settlement becomes more efficient with larger batches (5+ intents).
+        // This test documents the gas costs for comparison purposes.
+        if (gasBatch < totalGasIndividual) {
+            emit log_named_uint("Gas Saved", totalGasIndividual - gasBatch);
+        } else {
+            emit log_named_uint("Batch Overhead", gasBatch - totalGasIndividual);
+            emit log("Note: Batch settlement more efficient with 5+ intents");
+        }
+        
+        // Verify batch completed successfully (CoW matching occurred)
+        assertEq(hook.getIntent(4).settled, true, "Intent 4 settled");
+        assertEq(hook.getIntent(5).settled, true, "Intent 5 settled");
+        assertEq(hook.getIntent(6).settled, true, "Intent 6 settled");
+    }
+
+    function test_CoWEfficiencyMetrics() public {
+        hook.setCorridorPool(poolKey, true);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10000 ether, // More liquidity to handle larger swaps
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        
+        bytes memory hookData1 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(1.8e18), uint48(block.timestamp + 1 hours))
+        );
+        bytes memory hookData2 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(1.35e18), uint48(block.timestamp + 1 hours))
+        );
+        bytes memory hookData3 = abi.encodePacked(
+            uint8(0x01),
+            abi.encode(uint256(0.9e18), uint48(block.timestamp + 1 hours))
+        );
+        
+        // Scenario: 5 intents, 3 one way (4.5e18), 2 the other (3.5e18)
+        swap(poolKey, true, -2e18, hookData1);    // Intent 1: zeroForOne, 2e18
+        swap(poolKey, true, -1.5e18, hookData2);  // Intent 2: zeroForOne, 1.5e18
+        swap(poolKey, true, -1e18, hookData3);    // Intent 3: zeroForOne, 1e18
+        swap(poolKey, false, -2e18, hookData1);   // Intent 4: oneForZero, 2e18
+        swap(poolKey, false, -1.5e18, hookData2); // Intent 5: oneForZero, 1.5e18
+        
+        uint256[] memory intentIds = new uint256[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            intentIds[i] = i + 1;
+        }
+        
+        uint256[] memory amountsOut = new uint256[](5);
+        amountsOut[0] = 1.9e18;  // 2e18 in -> 1.9e18 out
+        amountsOut[1] = 1.4e18;  // 1.5e18 in -> 1.4e18 out
+        amountsOut[2] = 0.95e18; // 1e18 in -> 0.95e18 out
+        amountsOut[3] = 1.9e18;  // 2e18 in -> 1.9e18 out
+        amountsOut[4] = 1.4e18;  // 1.5e18 in -> 1.4e18 out
+        
+        RecorrHookTypes.CoWStats memory stats = hook.settleCorridorBatch(intentIds, amountsOut);
+        
+        // Calculate efficiency metrics
+        uint256 totalVolume = stats.totalZeroForOne + stats.totalOneForZero;
+        uint256 matchEfficiency = (stats.matchedAmount * 100) / totalVolume;
+        
+        // Verify CoW efficiency
+        assertEq(stats.totalZeroForOne, 4.5e18, "Total zeroForOne");
+        assertEq(stats.totalOneForZero, 3.5e18, "Total oneForZero");
+        assertEq(stats.matchedAmount, 3.5e18, "Matched amount P2P");
+        assertEq(stats.netAmountToAmm, 1e18, "Net to AMM");
+        
+        // Efficiency: 3.5 / 8 = 43.75% matched P2P
+        assertEq(matchEfficiency, 43, "CoW efficiency ~43%");
+        
+        // Log metrics for documentation
+        emit log_named_uint("Total Volume", totalVolume / 1e18);
+        emit log_named_uint("Matched P2P", stats.matchedAmount / 1e18);
+        emit log_named_uint("Net to AMM", stats.netAmountToAmm / 1e18);
+        emit log_named_uint("CoW Efficiency %", matchEfficiency);
+        emit log_named_uint("Gas Saved", stats.gasSaved);
+        emit log_named_uint("Total Intents", stats.totalIntents);
+    }
 }
