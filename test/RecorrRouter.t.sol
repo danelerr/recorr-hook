@@ -48,7 +48,7 @@ contract RecorrRouterTest is Test, Deployers {
         );
 
         // Mine hook address with correct permission bits
-        bytes memory constructorArgs = abi.encode(address(manager));
+        bytes memory constructorArgs = abi.encode(address(manager), address(this));
         (address expectedHookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             flags,
