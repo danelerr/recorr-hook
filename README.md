@@ -17,7 +17,9 @@
 ### Links
 
 - **Smart Contracts:** [github.com/danelerr/recorr-hook](https://github.com/danelerr/recorr-hook)
-- **Frontend Demo:** [github.com/danelerr/recorr-hook-frontend](https://github.com/danelerr/recorr-hook-frontend)
+- **Live Demo:** [recorr-hook-frontend.vercel.app](https://recorr-hook-frontend.vercel.app/)
+- **Frontend Repo:** [github.com/danelerr/recorr-hook-frontend](https://github.com/danelerr/recorr-hook-frontend)
+- **Video Demo:** [Watch on YouTube](https://youtu.be/BelSjPyDTxk)
 - **Pitch Deck:** [View on Canva](https://www.canva.com/design/DAG63IzsR5s/En0mDD2VR4ujJvvsEc_7EQ/view?utm_content=DAG63IzsR5s&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=he74500b53d)
 
 ---
