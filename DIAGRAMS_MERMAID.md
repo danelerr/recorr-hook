@@ -26,9 +26,8 @@ graph TB
         end
     end
 
-    subgraph "Off-Chain"
-        Operator[Operator EOA<br/>today<br/>AVS roadmap]
-        Indexer[Event Indexer]
+    subgraph "Manual Settlement"
+        Operator[Operator EOA<br/>Anyone can call settleBatch<br/>Future: AVS automation]
     end
 
     UI -->|1. Create Intent| Router
@@ -38,9 +37,8 @@ graph TB
     PM -->|afterSwap| Hook
     Hook -->|Store Intent| Hook
     
-    Hook -->|emit IntentCreated| Indexer
-    Indexer -->|Monitor Events| Operator
-    Operator -->|settleBatch| Hook
+    Hook -->|emit IntentCreated| Hook
+    Operator -->|Manual settleBatch call| Hook
     Hook -->|CoW Matching| Hook
     
     Router -->|bridgeTokens| Bridge
